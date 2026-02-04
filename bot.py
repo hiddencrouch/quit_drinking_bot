@@ -195,27 +195,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         next_dt = calculate_next_step_dt(user)
-        status_text = f"📊 **Ваш прогресс:** Шаг {step} из 50.\n"
+        status_text = f"📊 **Ваш прогресс:** {step} из 50\n"
 
         if next_dt:
             # Конвертируем UTC обратно в локальное время пользователя для отображения
             tz_offset = int(user['timezone']) if user['timezone'] else 0
             local_dt = next_dt + timedelta(hours=tz_offset)
             date_str = local_dt.strftime("%d.%m.%Y %H:%M")
-            status_text += f"⏰ Следующее уведомление придет: {date_str}"
+            status_text += f"⏰ Следующее занятие: {date_str}"
         else:
             status_text += "Следующий шаг пока не запланирован."
 
-        await update.message.reply_text(status_text, parse_mode='Markdown')
+        text = (
+            "Я бот для сопровождения "
+            "[курса по методу Шичко](https://telegra.ph/Brosit-pit-po-metodu-GA-SHichko-02-02).\n"
+            "Мы пройдем 50 шагов к свободе от алкогольной зависимости.\n\n"
+        ) + status_text
+
+        await update.message.reply_text(text, parse_mode='Markdown')
     else:
         # Если курс не начат (нет даты старта)
         text = (
-            "Привет! Я бот для сопровождения курса по методу Шичко.\n"
-            "Мы пройдем 50 шагов к свободе.\n\n"
-            "Для настройки мне нужно знать ваш часовой пояс (смещение от UTC) и желаемое время уведомлений."
+            "Привет! Я бот для сопровождения "
+            "[курса по методу Шичко](https://telegra.ph/Brosit-pit-po-metodu-GA-SHichko-02-02).\n"
+            "Мы пройдем 50 шагов к свободе от алкогольной зависимости.\n\n"
+            "Для настройки мне нужно знать ваш часовой пояс (смещение от UTC) и желаемое время уведомлений.\n\n"
+            "Учтите, что задание необходимо выполнять непосредственно перед сном."
         )
         keyboard = [[InlineKeyboardButton("🚀 Начать настройку", callback_data="setup_start")]]
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -227,7 +235,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "setup_start":
         await query.edit_message_text(
             "Введите ваше смещение от UTC (например, для Москвы +3 введите `3`, для Европы `1`).\n"
-            "Узнать свое смещение можно [здесь](https://www.timeanddate.com/time/map/).",
+            "Узнать свое смещение можно [здесь](https://time.is/your_time_zone).",
             parse_mode='Markdown'
         )
         return 1  # Состояние WAIT_TZ
@@ -310,7 +318,7 @@ async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Сохраняем настройки и стартуем
         db_upsert_user(user_id, timezone=str(tz), notification_time=hour, start_date=start_date, step=0)
 
-        await update.message.reply_text(f"Настройки сохранены! Курс начат {start_date}. Первое задание придет сейчас.")
+        await update.message.reply_text(f"Настройки сохранены! Курс начат {datetime.now().strftime("%d.%m.%Y")} г. Первое задание придет сейчас.")
 
         # Запускаем процесс (первое задание сразу)
         schedule_next_job(user_id, context.application, force_now=True)
@@ -361,8 +369,7 @@ if __name__ == "__main__":
         fallbacks=[CommandHandler("start", start)]
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("stop", stop_course))
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(button_handler, pattern="^(done_|stop_)"))

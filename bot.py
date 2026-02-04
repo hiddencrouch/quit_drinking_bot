@@ -67,16 +67,7 @@ def db_get_content(step_id):
 
 # --- ЛОГИКА УВЕДОМЛЕНИЙ ---
 
-async def send_step_notification(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    user_id = job.user_id
-    user = db_get_user(user_id)
-
-    if not user or not user['start_date']:
-        return
-
-    step_num = user['step'] + 1  # Следующий шаг
-
+def get_step_message(step_num):
     # Получаем контент
     step_row, article_row = db_get_content(step_num)
 
@@ -88,7 +79,24 @@ async def send_step_notification(context: ContextTypes.DEFAULT_TYPE):
     if step_num <= 10 and article_row:
         text += f"📖 Статья: [{article_row['title']}]({article_row['url']})\n"
 
-    keyboard = [[InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{step_num}")]]
+    return text
+
+async def send_step_notification(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    user_id = job.user_id
+    user = db_get_user(user_id)
+
+    if not user or not user['start_date']:
+        return
+
+    step_num = user['step'] + 1  # Следующий шаг
+
+    text = get_step_message(step_num)
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{step_num}")],
+        [InlineKeyboardButton("⛔ Прекратить курс", callback_data=f"stop_confirm_{step_num}")]
+    ]
 
     await context.bot.send_message(
         chat_id=user_id,
@@ -97,36 +105,32 @@ async def send_step_notification(context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-
-def schedule_next_job(user_id, application, force_now=False):
+def calculate_next_step_dt(user):
     """
-    Планирует следующий шаг.
-    Для 1-го шага: отправляет сразу (или в день старта).
-    Для остальных: считает разницу дней по графику и прибавляет к дате ПОСЛЕДНЕГО выполненного шага.
+    Вычисляет datetime следующего уведомления.
+    Возвращает None, если курс завершен или данные некорректны.
     """
-    user = db_get_user(user_id)
-    if not user:
-        return
+    if not user or not user['start_date']:
+        return None
 
     current_step = user['step']
     next_step = current_step + 1
 
     if next_step > 50:
-        return  # Курс завершен
+        return None  # Курс завершен
 
     # 1. Определяем базовую дату (от чего отсчитываем) и сколько дней ждать
     if current_step == 0:
         # Если это самый первый шаг — базой является дата старта
-        if not user['start_date']: return
         base_date = datetime.strptime(user['start_date'], "%Y-%m-%d").date()
-        days_to_add = 0  # Первый шаг в день старта (или сразу, если force_now)
+        days_to_add = 0
     else:
         # Если шаг > 0, считаем разницу между текущим и следующим по графику
         prev_schedule_day = SCHEDULE.get(current_step)
         next_schedule_day = SCHEDULE.get(next_step)
 
         if not prev_schedule_day or not next_schedule_day:
-            return  # Ошибка в графике
+            return None  # Ошибка в графике
 
         days_to_add = next_schedule_day - prev_schedule_day
 
@@ -147,6 +151,19 @@ def schedule_next_job(user_id, application, force_now=False):
     target_dt = datetime.combine(target_date, time(hour=notif_hour)) - timedelta(hours=tz_offset)
     target_dt = pytz.utc.localize(target_dt)
 
+    return target_dt
+
+
+def schedule_next_job(user_id, application, force_now=False):
+    """
+    Планирует следующий шаг.
+    """
+    user = db_get_user(user_id)
+    target_dt = calculate_next_step_dt(user)
+
+    if not target_dt:
+        return
+
     now = datetime.now(pytz.utc)
 
     # 4. Очистка старых задач и планирование новой
@@ -157,7 +174,6 @@ def schedule_next_job(user_id, application, force_now=False):
     # Если это первый шаг и он вызван при настройке (force_now), или время уже прошло
     if force_now or target_dt <= now:
         # Если это не первый шаг и время прошло сегодня — отправляем сразу.
-        # Но если "просрочено" на несколько дней, бот все равно отправит сразу, чтобы догнать.
         application.job_queue.run_once(send_step_notification, 5, user_id=user_id, name=str(user_id))
     else:
         delay = (target_dt - now).total_seconds()
@@ -169,14 +185,37 @@ def schedule_next_job(user_id, application, force_now=False):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db_upsert_user(user_id)  # Создаем запись, если нет
+    user = db_get_user(user_id)
 
-    text = (
-        "Привет! Я бот для сопровождения курса по методу Шичко.\n"
-        "Мы пройдем 50 шагов к свободе.\n\n"
-        "Для настройки мне нужно знать ваш часовой пояс (смещение от UTC) и желаемое время уведомлений."
-    )
-    keyboard = [[InlineKeyboardButton("🚀 Начать настройку", callback_data="setup_start")]]
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    # Если курс активен (есть дата старта)
+    if user and user['start_date']:
+        step = user['step']
+        if step > 50:
+            await update.message.reply_text("🎉 Поздравляем! Вы прошли весь курс из 50 шагов.")
+            return
+
+        next_dt = calculate_next_step_dt(user)
+        status_text = f"📊 **Ваш прогресс:** Шаг {step} из 50.\n"
+
+        if next_dt:
+            # Конвертируем UTC обратно в локальное время пользователя для отображения
+            tz_offset = int(user['timezone']) if user['timezone'] else 0
+            local_dt = next_dt + timedelta(hours=tz_offset)
+            date_str = local_dt.strftime("%d.%m.%Y %H:%M")
+            status_text += f"⏰ Следующее уведомление придет: {date_str}"
+        else:
+            status_text += "Следующий шаг пока не запланирован."
+
+        await update.message.reply_text(status_text, parse_mode='Markdown')
+    else:
+        # Если курс не начат (нет даты старта)
+        text = (
+            "Привет! Я бот для сопровождения курса по методу Шичко.\n"
+            "Мы пройдем 50 шагов к свободе.\n\n"
+            "Для настройки мне нужно знать ваш часовой пояс (смещение от UTC) и желаемое время уведомлений."
+        )
+        keyboard = [[InlineKeyboardButton("🚀 Начать настройку", callback_data="setup_start")]]
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -187,8 +226,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "setup_start":
         await query.edit_message_text(
-            "Введите ваше смещение от UTC (например, для Москвы +3 введите `3`, для Европы `1`):")
+            "Введите ваше смещение от UTC (например, для Москвы +3 введите `3`, для Европы `1`).\n"
+            "Узнать свое смещение можно [здесь](https://www.timeanddate.com/time/map/).",
+            parse_mode='Markdown'
+        )
         return 1  # Состояние WAIT_TZ
+
+    if data.startswith("stop_confirm_"):
+        step_num = int(data.split("_")[2])
+        await query.edit_message_text(
+            text="⚠️ Вы уверены, что хотите прекратить курс? Весь прогресс будет сброшен.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Да, прекратить", callback_data=f"stop_execute_{step_num}")],
+                [InlineKeyboardButton("Нет, вернуться", callback_data=f"stop_cancel_{step_num}")]
+            ])
+        )
+        return
+
+    if data.startswith("stop_execute_"):
+        db_upsert_user(user_id, start_date=None)
+        current_jobs = context.application.job_queue.get_jobs_by_name(str(user_id))
+        for job in current_jobs:
+            job.schedule_removal()
+
+        await query.edit_message_text("❌ Курс остановлен. Уведомления отключены. Напишите /start, чтобы начать заново.")
+        return
+
+    if data.startswith("stop_cancel_"):
+        step_num = int(data.split("_")[2])
+        text = get_step_message(step_num)
+        keyboard = [
+            [InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{step_num}")],
+            [InlineKeyboardButton("⛔ Прекратить курс", callback_data=f"stop_confirm_{step_num}")]
+        ]
+        await query.edit_message_text(text=text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+        return
 
     if data.startswith("done_"):
         step_done = int(data.split("_")[1])
@@ -196,11 +268,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         db_upsert_user(user_id, step=step_done, step_date=now_str)
 
-        await query.edit_message_text(
-            f"✅ Шаг {step_done} отмечен выполненным! Следующий материал придет согласно графику.")
-
         # Планируем следующий
         schedule_next_job(user_id, context.application)
+
+        # Вычисляем время следующего напоминания
+        user = db_get_user(user_id)
+        next_dt = calculate_next_step_dt(user)
+
+        msg = f"✅ Шаг {step_done} отмечен выполненным!"
+        if next_dt:
+            tz_offset = int(user['timezone']) if user['timezone'] else 0
+            local_dt = next_dt + timedelta(hours=tz_offset)
+            date_str = local_dt.strftime("%d.%m.%Y %H:%M")
+            msg += f"\n⏰ Следующее напоминание придет: {date_str}"
+        else:
+            msg += "\n🎉 Это был последний шаг!"
+
+        await query.edit_message_text(msg)
 
 
 async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -278,9 +362,10 @@ if __name__ == "__main__":
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("stop", stop_course))
     app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^done_"))
+    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(done_|stop_)"))
 
     # Восстановление задач при старте
     app.job_queue.run_once(lambda ctx: restore_jobs(app), 1)

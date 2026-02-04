@@ -23,6 +23,11 @@ SCHEDULE.update({
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
+# --- STATES ---
+WAIT_TZ = 1
+WAIT_TIME = 2
+WAIT_NEW_TZ = 3
+WAIT_NEW_TIME = 4
 
 # --- РАБОТА С БД ---
 def get_db_connection():
@@ -225,6 +230,63 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("🚀 Начать настройку", callback_data="setup_start")]]
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = db_get_user(user_id)
+
+    if not user:
+        await update.message.reply_text("Пожалуйста, запустите /start.")
+        return
+
+    tz = user['timezone'] if user['timezone'] else "Не задано"
+    notif_time = user['notification_time'] if user['notification_time'] is not None else "Не задано"
+
+    text = (
+        f"⚙️ **Настройки**\n\n"
+        f"🌍 Часовой пояс: UTC{'+' if isinstance(tz, str) and tz.replace('-','').isdigit() and int(tz) >= 0 else ''}{tz}\n"
+        f"⏰ Время уведомлений: {notif_time}:00\n"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🌍 Изменить часовой пояс", callback_data="settings_tz")],
+        [InlineKeyboardButton("⏰ Изменить время", callback_data="settings_time")],
+    ]
+
+    if user['start_date']:
+        keyboard.append([InlineKeyboardButton("⛔ Прекратить курс", callback_data="settings_stop")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔄 Начать заново", callback_data="setup_start")])
+
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def show_settings_menu(update: Update, user_id):
+    """Helper to refresh settings menu, used in back buttons"""
+    user = db_get_user(user_id)
+
+    tz = user['timezone'] if user['timezone'] else "Не задано"
+    notif_time = user['notification_time'] if user['notification_time'] is not None else "Не задано"
+
+    text = (
+        f"⚙️ **Настройки**\n\n"
+        f"🌍 Часовой пояс: UTC{'+' if isinstance(tz, str) and tz.replace('-','').isdigit() and int(tz) >= 0 else ''}{tz}\n"
+        f"⏰ Время уведомлений: {notif_time}:00\n"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🌍 Изменить часовой пояс", callback_data="settings_tz")],
+        [InlineKeyboardButton("⏰ Изменить время", callback_data="settings_time")],
+    ]
+
+    if user['start_date']:
+        keyboard.append([InlineKeyboardButton("⛔ Прекратить курс", callback_data="settings_stop")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔄 Начать заново", callback_data="setup_start")])
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text=text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -238,7 +300,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Узнать свое смещение можно [здесь](https://time.is/your_time_zone).",
             parse_mode='Markdown'
         )
-        return 1  # Состояние WAIT_TZ
+        return WAIT_TZ
+
+    if data == "settings_tz":
+        await query.edit_message_text(
+             "Введите новое смещение от UTC (например, 3 или -1):"
+        )
+        return WAIT_NEW_TZ
+
+    if data == "settings_time":
+        await query.edit_message_text(
+             "Введите новый час для уведомлений (0-23):"
+        )
+        return WAIT_NEW_TIME
+
+    if data == "settings_stop":
+        await query.edit_message_text(
+            text="⚠️ Вы уверены, что хотите прекратить курс? Весь прогресс будет сброшен.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Да, прекратить", callback_data=f"stop_execute_settings")],
+                [InlineKeyboardButton("Нет, вернуться", callback_data=f"settings_back")]
+            ])
+        )
+        return
+
+    if data == "settings_back":
+        await show_settings_menu(update, user_id)
+        return
 
     if data.startswith("stop_confirm_"):
         step_num = int(data.split("_")[2])
@@ -257,7 +345,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for job in current_jobs:
             job.schedule_removal()
 
-        await query.edit_message_text("❌ Курс остановлен. Уведомления отключены. Напишите /start, чтобы начать заново.")
+        if data == "stop_execute_settings":
+            await query.edit_message_text("❌ Курс остановлен. Уведомления отключены. Вы можете начать заново в /settings или /start.")
+            # Optionally show settings again? No, let user decide.
+        else:
+            await query.edit_message_text("❌ Курс остановлен. Уведомления отключены. Напишите /start, чтобы начать заново.")
         return
 
     if data.startswith("stop_cancel_"):
@@ -300,10 +392,10 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tz = int(update.message.text)
         context.user_data['tz'] = tz
         await update.message.reply_text("Отлично. Теперь введите час для уведомлений (0-23):")
-        return 2  # Состояние WAIT_TIME
+        return WAIT_TIME
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите число (например: 3).")
-        return 1
+        return WAIT_TZ
 
 
 async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,15 +410,42 @@ async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Сохраняем настройки и стартуем
         db_upsert_user(user_id, timezone=str(tz), notification_time=hour, start_date=start_date, step=0)
 
-        await update.message.reply_text(f"Настройки сохранены! Курс начат {datetime.now().strftime("%d.%m.%Y")} г. Первое задание придет сейчас.")
+        await update.message.reply_text(f"Настройки сохранены! Курс начат {datetime.now().strftime('%d.%m.%Y')} г. Первое задание придет сейчас.")
 
         # Запускаем процесс (первое задание сразу)
         schedule_next_job(user_id, context.application, force_now=True)
         return ConversationHandler.END
     except ValueError:
         await update.message.reply_text("Введите число от 0 до 23.")
-        return 2
+        return WAIT_TIME
 
+async def update_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        new_tz = int(update.message.text)
+        user_id = update.effective_user.id
+        db_upsert_user(user_id, timezone=str(new_tz))
+
+        await update.message.reply_text(f"✅ Часовой пояс изменен на UTC{'+' if new_tz >= 0 else ''}{new_tz}.")
+        schedule_next_job(user_id, context.application, force_now=False) # Reschedule if needed
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("Пожалуйста, введите число.")
+        return WAIT_NEW_TZ
+
+async def update_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        new_time = int(update.message.text)
+        if not (0 <= new_time <= 23): raise ValueError
+
+        user_id = update.effective_user.id
+        db_upsert_user(user_id, notification_time=new_time)
+
+        await update.message.reply_text(f"✅ Время уведомлений изменено на {new_time}:00.")
+        schedule_next_job(user_id, context.application, force_now=False) # Reschedule if needed
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("Введите число от 0 до 23.")
+        return WAIT_NEW_TIME
 
 async def stop_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -359,20 +478,30 @@ async def restore_jobs(application):
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Стейт машина для настройки
+    # Стейт машина для настройки и обновлений
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^setup_start$")],
+        entry_points=[
+            CallbackQueryHandler(button_handler, pattern="^setup_start$"),
+            CallbackQueryHandler(button_handler, pattern="^settings_(tz|time)$")
+        ],
         states={
-            1: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_timezone)],
-            2: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_time)],
+            WAIT_TZ: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_timezone)],
+            WAIT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_time)],
+            WAIT_NEW_TZ: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_timezone)],
+            WAIT_NEW_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_time)],
         },
-        fallbacks=[CommandHandler("start", start)]
+        fallbacks=[CommandHandler("start", start), CommandHandler("settings", settings_command)]
     )
 
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("stop", stop_course))
+    app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(done_|stop_)"))
+
+    # Callback handler for things outside conversation (or if conversation fails to catch)
+    # Important: The conversation handler catches patterns in entry_points.
+    # We need a general handler for other buttons (done_, stop_confirm_, settings_stop, etc.)
+    app.add_handler(CallbackQueryHandler(button_handler))
 
     # Восстановление задач при старте
     app.job_queue.run_once(lambda ctx: restore_jobs(app), 1)

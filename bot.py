@@ -2,7 +2,7 @@ import logging
 import sqlite3
 import pytz
 from datetime import datetime, time, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler,
     CallbackQueryHandler, ConversationHandler, MessageHandler, filters
@@ -77,12 +77,15 @@ def get_step_message(step_num):
     step_row, article_row = db_get_content(step_num)
 
     text = f"📅 **Шаг {step_num}**\n\n"
-    if step_row:
-        text += f"📝 [Дневник №{step_num}]({step_row['url']})\n"
 
     # Статьи отправляем только для первых 10 шагов (по условию)
     if step_num <= 10 and article_row:
-        text += f"📖 Статья: [{article_row['title']}]({article_row['url']})\n"
+        text += (f"Прочтите статью:\n"
+                 f"📖 [{article_row['title']}]({article_row['url']})\n\n")
+
+    if step_row:
+        text += (f"Заполните непосредственно перед сном:\n"
+                 f"📝 [Дневник №{step_num}]({step_row['url']})\n")
 
     return text
 
@@ -107,7 +110,8 @@ async def send_step_notification(context: ContextTypes.DEFAULT_TYPE):
         chat_id=user_id,
         text=text,
         parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
 
 def calculate_next_step_dt(user):
@@ -212,12 +216,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_text += "Следующий шаг пока не запланирован."
 
         text = (
-            "Я бот для сопровождения "
-            "[курса по методу Шичко](https://telegra.ph/Brosit-pit-po-metodu-GA-SHichko-02-02).\n"
-            "Мы пройдем 50 шагов к свободе от алкогольной зависимости.\n\n"
-        ) + status_text
+            "[Курс по методу Шичко](https://telegra.ph/Brosit-pit-po-metodu-GA-SHichko-02-02).\n\n"
+            f"**Ваша активность**:\n"
+            f"{status_text}\n\n"
+        )
 
-        await update.message.reply_text(text, parse_mode='Markdown')
+        tz = user['timezone'] if user['timezone'] else "Не задано"
+        notif_time = user['notification_time'] if user['notification_time'] is not None else "Не задано"
+
+        text += (
+            f"**Настройки**:\n"
+            f"🌍 Часовой пояс: UTC{'+' if isinstance(tz, str) and tz.replace('-', '').isdigit() and int(tz) >= 0 else ''}{tz}\n"
+            f"⏰ Время уведомлений: {notif_time}:00\n"
+        )
+
+        keyboard = [
+            [InlineKeyboardButton("🌍 Изменить часовой пояс", callback_data="settings_tz")],
+            [InlineKeyboardButton("⏰ Изменить время", callback_data="settings_time")],
+        ]
+
+        if user['start_date']:
+            keyboard.append([InlineKeyboardButton("⛔ Прекратить курс", callback_data="settings_stop")])
+        else:
+            keyboard.append([InlineKeyboardButton("🔄 Начать заново", callback_data="setup_start")])
+
+        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard),
+                                        link_preview_options=LinkPreviewOptions(is_disabled=True))
     else:
         # Если курс не начат (нет даты старта)
         text = (
@@ -242,7 +266,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notif_time = user['notification_time'] if user['notification_time'] is not None else "Не задано"
 
     text = (
-        f"⚙️ **Настройки**\n\n"
+        f"Настройки:\n"
         f"🌍 Часовой пояс: UTC{'+' if isinstance(tz, str) and tz.replace('-','').isdigit() and int(tz) >= 0 else ''}{tz}\n"
         f"⏰ Время уведомлений: {notif_time}:00\n"
     )
@@ -267,7 +291,7 @@ async def show_settings_menu(update: Update, user_id):
     notif_time = user['notification_time'] if user['notification_time'] is not None else "Не задано"
 
     text = (
-        f"⚙️ **Настройки**\n\n"
+        f"Настройки:\n"
         f"🌍 Часовой пояс: UTC{'+' if isinstance(tz, str) and tz.replace('-','').isdigit() and int(tz) >= 0 else ''}{tz}\n"
         f"⏰ Время уведомлений: {notif_time}:00\n"
     )
@@ -296,9 +320,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "setup_start":
         await query.edit_message_text(
-            "Введите ваше смещение от UTC (например, для Москвы +3 введите `3`, для Европы `1`).\n"
+            "Введите ваше смещение от UTC (например, для Москвы +3 введите `3`, для Европы `1`). "
             "Узнать свое смещение можно [здесь](https://time.is/your_time_zone).",
-            parse_mode='Markdown'
+            parse_mode='Markdown',
+            link_preview_options=LinkPreviewOptions(is_disabled=True)
         )
         return WAIT_TZ
 
@@ -316,7 +341,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "settings_stop":
         await query.edit_message_text(
-            text="⚠️ Вы уверены, что хотите прекратить курс? Весь прогресс будет сброшен.",
+            text="⚠️ Вы уверены, что хотите прекратить курс?",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Да, прекратить", callback_data=f"stop_execute_settings")],
                 [InlineKeyboardButton("Нет, вернуться", callback_data=f"settings_back")]
@@ -331,7 +356,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("stop_confirm_"):
         step_num = int(data.split("_")[2])
         await query.edit_message_text(
-            text="⚠️ Вы уверены, что хотите прекратить курс? Весь прогресс будет сброшен.",
+            text="⚠️ Вы уверены, что хотите прекратить курс?",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Да, прекратить", callback_data=f"stop_execute_{step_num}")],
                 [InlineKeyboardButton("Нет, вернуться", callback_data=f"stop_cancel_{step_num}")]
@@ -346,10 +371,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job.schedule_removal()
 
         if data == "stop_execute_settings":
-            await query.edit_message_text("❌ Курс остановлен. Уведомления отключены. Вы можете начать заново в /settings или /start.")
+            await query.edit_message_text(
+                "❌ Курс остановлен. Уведомления отключены. Вы можете начать заново в /settings или /start."
+            )
             # Optionally show settings again? No, let user decide.
         else:
-            await query.edit_message_text("❌ Курс остановлен. Уведомления отключены. Напишите /start, чтобы начать заново.")
+            await query.edit_message_text(
+                "❌ Курс остановлен. Уведомления отключены. Напишите /start, чтобы начать заново."
+            )
         return
 
     if data.startswith("stop_cancel_"):
@@ -359,7 +388,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{step_num}")],
             [InlineKeyboardButton("⛔ Прекратить курс", callback_data=f"stop_confirm_{step_num}")]
         ]
-        await query.edit_message_text(text=text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text=text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard),
+                                      link_preview_options=LinkPreviewOptions(is_disabled=True))
         return
 
     if data.startswith("done_"):
@@ -380,7 +410,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tz_offset = int(user['timezone']) if user['timezone'] else 0
             local_dt = next_dt + timedelta(hours=tz_offset)
             date_str = local_dt.strftime("%d.%m.%Y %H:%M")
-            msg += f"\n⏰ Следующее напоминание придет: {date_str}"
+            msg += f"\n⏰ Следующее занятие: {date_str}"
         else:
             msg += "\n🎉 Это был последний шаг!"
 
@@ -410,7 +440,9 @@ async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Сохраняем настройки и стартуем
         db_upsert_user(user_id, timezone=str(tz), notification_time=hour, start_date=start_date, step=0)
 
-        await update.message.reply_text(f"Настройки сохранены! Курс начат {datetime.now().strftime('%d.%m.%Y')} г. Первое задание придет сейчас.")
+        await update.message.reply_text(
+            f"Настройки сохранены! Курс начат {datetime.now().strftime('%d.%m.%Y')} г. Первое задание придет сейчас."
+        )
 
         # Запускаем процесс (первое задание сразу)
         schedule_next_job(user_id, context.application, force_now=True)
